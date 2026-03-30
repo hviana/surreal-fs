@@ -51,7 +51,7 @@ control, and a crash-resilient garbage collector.
 │  │   ┌──────────────┐         ┌─────────────────┐    │       │
 │  │   │ uri  (UNIQUE)│         │ upload_id       │    │       │
 │  │   │ path[]       │────────▶│ chunk_index     │    │       │
-│  │   │ size         │         │ data (base64)   │    │       │
+│  │   │ size         │         │ data            │    │       │
 │  │   │ metadata     │         └─────────────────┘    │       │
 │  │   │ upload_id    │                                │       │
 │  │   │ status       │                                │       │
