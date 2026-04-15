@@ -47,8 +47,13 @@
 export interface SaveControlResult {
   /** Whether the caller is allowed to save at this path. Defaults to `true`. */
   accessAllowed?: boolean;
-  /** Max 64 KB chunks written per second. Defaults to `Number.MAX_SAFE_INTEGER`. */
-  chunksPerSecond?: number;
+  /**
+   * Write throughput limit in **kilobytes per second** (1 KB = 1024 bytes).
+   * Converted internally to whole 64 KB chunks per second
+   * (`ceil(kbytesPerSecond / 64)`, min 1).
+   * Defaults to `Number.MAX_SAFE_INTEGER` (no limit).
+   */
+  kbytesPerSecond?: number;
   /**
    * Sub-elements of the path used as concurrency identifiers.
    * Each identifier is incremented by 1 in the save concurrency map when the
@@ -69,8 +74,13 @@ export interface SaveControlResult {
 export interface ReadControlResult {
   /** Whether the caller is allowed to read at this path. Defaults to `true`. */
   accessAllowed?: boolean;
-  /** Max 64 KB chunks read per second. Defaults to `Number.MAX_SAFE_INTEGER`. */
-  chunksPerSecond?: number;
+  /**
+   * Read throughput limit in **kilobytes per second** (1 KB = 1024 bytes).
+   * Converted internally to whole 64 KB chunks per second
+   * (`ceil(kbytesPerSecond / 64)`, min 1).
+   * Defaults to `Number.MAX_SAFE_INTEGER` (no limit).
+   */
+  kbytesPerSecond?: number;
   /**
    * Sub-elements of the path used as concurrency identifiers.
    * Same semantics as {@link SaveControlResult.concurrencyIdentifiers}.
@@ -211,7 +221,7 @@ const defaultSaveControl = (
   _map: Record<string, number | undefined>,
 ): SaveControlResult => ({
   accessAllowed: true,
-  chunksPerSecond: Number.MAX_SAFE_INTEGER,
+  kbytesPerSecond: Number.MAX_SAFE_INTEGER,
   concurrencyIdentifiers: [],
   maxFileSizeBytes: Number.MAX_SAFE_INTEGER,
   allowedExtensions: [],
@@ -223,7 +233,7 @@ const defaultReadControl = (
   _map: Record<string, number | undefined>,
 ): ReadControlResult => ({
   accessAllowed: true,
-  chunksPerSecond: Number.MAX_SAFE_INTEGER,
+  kbytesPerSecond: Number.MAX_SAFE_INTEGER,
   concurrencyIdentifiers: [],
   maxPageSize: 1000,
   cursor: undefined,
@@ -241,6 +251,29 @@ const DEC = new TextDecoder();
 
 /** @internal 64 KB chunk size. */
 const CHUNK_SIZE = 65_536;
+
+/** @internal Chunk size in kilobytes (1 KB = 1024 bytes). */
+const CHUNK_SIZE_KB = CHUNK_SIZE / 1024;
+
+/**
+ * Convert a user-supplied KB/s throughput limit into the integer
+ * chunks-per-second value consumed by {@link throttleTransform}.
+ *
+ * One chunk is {@link CHUNK_SIZE_KB} KB, so the conversion is
+ * `ceil(kbps / CHUNK_SIZE_KB)`. A floor of 1 ensures any positive KB/s
+ * setting permits forward progress (sub-chunk rates simply mean one chunk
+ * per second). `Number.MAX_SAFE_INTEGER` is passed through untouched to
+ * preserve the "no limit" sentinel.
+ *
+ * @internal
+ */
+function kbpsToChunksPerSecond(kbps: number): number {
+  if (!Number.isFinite(kbps) || kbps >= Number.MAX_SAFE_INTEGER) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+  if (kbps <= 0) return 1;
+  return Math.max(1, Math.ceil(kbps / CHUNK_SIZE_KB));
+}
 
 /**
  * Generate a universally unique upload identifier.
@@ -1052,7 +1085,7 @@ export class SurrealFS {
    *   metadata: { author: "CFO" },
    *   control: (path, map) => ({
    *     accessAllowed: true,
-   *     chunksPerSecond: 50,
+   *     kbytesPerSecond: 3200, // ~50 chunks/s
    *     concurrencyIdentifiers: [path[0]],
    *     maxFileSizeBytes: 10 * 1024 * 1024,
    *     allowedExtensions: ["txt", "pdf"],
@@ -1108,7 +1141,9 @@ export class SurrealFS {
     this.incrementConcurrency(identifiers, this._saveConcurrencyMap);
     this._savingFiles[uri] = 0;
 
-    const chunksPerSecond = ctrl.chunksPerSecond ?? Number.MAX_SAFE_INTEGER;
+    const chunksPerSecond = kbpsToChunksPerSecond(
+      ctrl.kbytesPerSecond ?? Number.MAX_SAFE_INTEGER,
+    );
     const maxSize = ctrl.maxFileSizeBytes ?? Number.MAX_SAFE_INTEGER;
     const uploadId = newUploadId();
 
@@ -1339,7 +1374,9 @@ export class SurrealFS {
     };
 
     const identifiers = ctrl.concurrencyIdentifiers ?? [];
-    const chunksPerSecond = ctrl.chunksPerSecond ?? Number.MAX_SAFE_INTEGER;
+    const chunksPerSecond = kbpsToChunksPerSecond(
+      ctrl.kbytesPerSecond ?? Number.MAX_SAFE_INTEGER,
+    );
 
     // Clamp skip to [0, size]. A skip at or past EOF produces an empty stream.
     const rawSkip = options.skip ?? 0;
@@ -1429,7 +1466,9 @@ export class SurrealFS {
 
     const rows = queryRows<any>(await this.db.query(sql, params));
     const res: DirList = { files: [], size: 0 };
-    const chunksPerSecond = ctrl.chunksPerSecond ?? Number.MAX_SAFE_INTEGER;
+    const chunksPerSecond = kbpsToChunksPerSecond(
+      ctrl.kbytesPerSecond ?? Number.MAX_SAFE_INTEGER,
+    );
     const identifiers = ctrl.concurrencyIdentifiers ?? [];
 
     for (const row of rows) {

@@ -10,17 +10,17 @@ control, and a crash-resilient garbage collector.
 
 ## ✨ Highlights
 
-| Feature                    | Description                                                                                   |
-| -------------------------- | --------------------------------------------------------------------------------------------- |
-| 📦 **Chunked storage**     | Files split into 64 KB chunks across a dedicated table                                        |
-| 🔄 **Atomic replacement**  | Old file data is removed only after a new upload fully commits                                |
-| 🧹 **Garbage collector**   | Incomplete uploads/deletes are cleaned up automatically on init                               |
-| 🚦 **Rate limiting**       | Configurable chunks-per-second via `TransformStream` (no `delay`)                             |
-| 🔒 **Concurrency control** | Multi-factor maps keyed by path sub-elements — separate maps for uploads and downloads        |
-| 📁 **Directory semantics** | Hierarchical path arrays with cursor-based pagination for listings                            |
-| 🔐 **SHA3-512 integrity**  | Hash computed **iteratively per chunk** during upload — no memory blow-up                     |
-| ⏭️ **Range reads (skip)**  | Stream from any byte offset — jump to middle / end / beginning without reading earlier chunks |
-| 🌐 **Web-standard APIs**   | `ReadableStream`, `TransformStream`, `TextEncoder`, `crypto.randomUUID`                       |
+| Feature                    | Description                                                                                       |
+| -------------------------- | ------------------------------------------------------------------------------------------------- |
+| 📦 **Chunked storage**     | Files split into 64 KB chunks across a dedicated table                                            |
+| 🔄 **Atomic replacement**  | Old file data is removed only after a new upload fully commits                                    |
+| 🧹 **Garbage collector**   | Incomplete uploads/deletes are cleaned up automatically on init                                   |
+| 🚦 **Rate limiting**       | Configurable **KB/s** via `TransformStream` (no `delay`) — converted to 64 KB chunks/s internally |
+| 🔒 **Concurrency control** | Multi-factor maps keyed by path sub-elements — separate maps for uploads and downloads            |
+| 📁 **Directory semantics** | Hierarchical path arrays with cursor-based pagination for listings                                |
+| 🔐 **SHA3-512 integrity**  | Hash computed **iteratively per chunk** during upload — no memory blow-up                         |
+| ⏭️ **Range reads (skip)**  | Stream from any byte offset — jump to middle / end / beginning without reading earlier chunks     |
+| 🌐 **Web-standard APIs**   | `ReadableStream`, `TransformStream`, `TextEncoder`, `crypto.randomUUID`                           |
 
 ---
 
@@ -36,7 +36,7 @@ control, and a crash-resilient garbage collector.
 │  ┌──────────────────────────────────────────────┐            │
 │  │            Control Callback                  │            │
 │  │  • Access check                              │            │
-│  │  • Rate limit (chunks/s)                     │            │
+│  │  • Rate limit (KB/s)                         │            │
 │  │  • Concurrency identifiers                   │            │
 │  │  • Size / extension limits                   │            │
 │  └──────────────────────────────────────────────┘            │
@@ -188,13 +188,13 @@ Upload a file to SurrealDB.
 
 #### `SaveControlResult`
 
-| Field                    | Type       | Default            | Description                  |
-| ------------------------ | ---------- | ------------------ | ---------------------------- |
-| `accessAllowed`          | `boolean`  | `true`             | Allow or deny this operation |
-| `chunksPerSecond`        | `number`   | `MAX_SAFE_INTEGER` | Throughput limit             |
-| `concurrencyIdentifiers` | `string[]` | `[]`               | Concurrency map keys         |
-| `maxFileSizeBytes`       | `number`   | `MAX_SAFE_INTEGER` | File size cap                |
-| `allowedExtensions`      | `string[]` | `[]`               | Empty = all allowed          |
+| Field                    | Type       | Default            | Description                                                       |
+| ------------------------ | ---------- | ------------------ | ----------------------------------------------------------------- |
+| `accessAllowed`          | `boolean`  | `true`             | Allow or deny this operation                                      |
+| `kbytesPerSecond`        | `number`   | `MAX_SAFE_INTEGER` | Write throughput in KB/s (internally converted to 64 KB chunks/s) |
+| `concurrencyIdentifiers` | `string[]` | `[]`               | Concurrency map keys                                              |
+| `maxFileSizeBytes`       | `number`   | `MAX_SAFE_INTEGER` | File size cap                                                     |
+| `allowedExtensions`      | `string[]` | `[]`               | Empty = all allowed                                               |
 
 #### Examples
 
@@ -232,7 +232,7 @@ const result = await fs.save({
 
     return {
       accessAllowed: userHasPermission(companyId),
-      chunksPerSecond: 100, // ~6.4 MB/s
+      kbytesPerSecond: 6400, // ~6.4 MB/s (≈100 chunks/s)
       concurrencyIdentifiers: [companyId, projectId],
       maxFileSizeBytes: 50 * 1024 * 1024, // 50 MB
       allowedExtensions: ["png", "jpg", "webp", "svg"],
@@ -277,13 +277,13 @@ content.
 
 #### `ReadControlResult`
 
-| Field                    | Type       | Default            | Description                       |
-| ------------------------ | ---------- | ------------------ | --------------------------------- |
-| `accessAllowed`          | `boolean`  | `true`             | Allow or deny                     |
-| `chunksPerSecond`        | `number`   | `MAX_SAFE_INTEGER` | Read throughput limit             |
-| `concurrencyIdentifiers` | `string[]` | `[]`               | Concurrency map keys              |
-| `maxPageSize`            | `number`   | `1000`             | Entries per page (for `readDir`)  |
-| `cursor`                 | `any`      | `undefined`        | Pagination cursor (for `readDir`) |
+| Field                    | Type       | Default            | Description                                                      |
+| ------------------------ | ---------- | ------------------ | ---------------------------------------------------------------- |
+| `accessAllowed`          | `boolean`  | `true`             | Allow or deny                                                    |
+| `kbytesPerSecond`        | `number`   | `MAX_SAFE_INTEGER` | Read throughput in KB/s (internally converted to 64 KB chunks/s) |
+| `concurrencyIdentifiers` | `string[]` | `[]`               | Concurrency map keys                                             |
+| `maxPageSize`            | `number`   | `1000`             | Entries per page (for `readDir`)                                 |
+| `cursor`                 | `any`      | `undefined`        | Pagination cursor (for `readDir`)                                |
 
 #### Examples
 
@@ -325,7 +325,7 @@ const file = await fs.read({
   path: ["videos", "presentation.mp4"],
   control: (path, map) => ({
     accessAllowed: true,
-    chunksPerSecond: 32, // ~2 MB/s
+    kbytesPerSecond: 2048, // ~2 MB/s (≈32 chunks/s)
     concurrencyIdentifiers: ["video-streaming"],
   }),
 });
@@ -587,7 +587,7 @@ const saveControl = (
 
   return {
     accessAllowed: userUploads < 5 && tenantUploads < 20,
-    chunksPerSecond: tenantUploads > 10 ? 25 : 100,
+    kbytesPerSecond: tenantUploads > 10 ? 1600 : 6400, // ~25 vs ~100 chunks/s
     concurrencyIdentifiers: [userId, tenantId],
     maxFileSizeBytes: 100 * 1024 * 1024,
     allowedExtensions: [],
@@ -741,7 +741,7 @@ const uploadControl = (
 
   return {
     accessAllowed: true,
-    chunksPerSecond: plan === "free" ? 16 : 256,
+    kbytesPerSecond: plan === "free" ? 1024 : 16384, // ~16 vs ~256 chunks/s
     concurrencyIdentifiers: [tenantId],
     maxFileSizeBytes: tenantLimits[plan] ?? tenantLimits.free,
     allowedExtensions: [],
