@@ -10,15 +10,17 @@ control, and a crash-resilient garbage collector.
 
 ## ✨ Highlights
 
-| Feature                    | Description                                                                            |
-| -------------------------- | -------------------------------------------------------------------------------------- |
-| 📦 **Chunked storage**     | Files split into 64 KB chunks across a dedicated table                                 |
-| 🔄 **Atomic replacement**  | Old file data is removed only after a new upload fully commits                         |
-| 🧹 **Garbage collector**   | Incomplete uploads/deletes are cleaned up automatically on init                        |
-| 🚦 **Rate limiting**       | Configurable chunks-per-second via `TransformStream` (no `delay`)                      |
-| 🔒 **Concurrency control** | Multi-factor maps keyed by path sub-elements — separate maps for uploads and downloads |
-| 📁 **Directory semantics** | Hierarchical path arrays with cursor-based pagination for listings                     |
-| 🌐 **Web-standard APIs**   | `ReadableStream`, `TransformStream`, `TextEncoder`, `crypto.randomUUID`                |
+| Feature                    | Description                                                                                   |
+| -------------------------- | --------------------------------------------------------------------------------------------- |
+| 📦 **Chunked storage**     | Files split into 64 KB chunks across a dedicated table                                        |
+| 🔄 **Atomic replacement**  | Old file data is removed only after a new upload fully commits                                |
+| 🧹 **Garbage collector**   | Incomplete uploads/deletes are cleaned up automatically on init                               |
+| 🚦 **Rate limiting**       | Configurable chunks-per-second via `TransformStream` (no `delay`)                             |
+| 🔒 **Concurrency control** | Multi-factor maps keyed by path sub-elements — separate maps for uploads and downloads        |
+| 📁 **Directory semantics** | Hierarchical path arrays with cursor-based pagination for listings                            |
+| 🔐 **SHA3-512 integrity**  | Hash computed **iteratively per chunk** during upload — no memory blow-up                     |
+| ⏭️ **Range reads (skip)**  | Stream from any byte offset — jump to middle / end / beginning without reading earlier chunks |
+| 🌐 **Web-standard APIs**   | `ReadableStream`, `TransformStream`, `TextEncoder`, `crypto.randomUUID`                       |
 
 ---
 
@@ -95,6 +97,7 @@ const result = await fs.save({
 
 if ("size" in result) {
   console.log(`Saved ${result.size} bytes`);
+  console.log(`SHA3-512: ${(result as any).hash}`);
 }
 ```
 
@@ -266,10 +269,11 @@ content.
 
 #### Parameters — `ReadOptions`
 
-| Field     | Type                                              | Required | Description                    |
-| --------- | ------------------------------------------------- | -------- | ------------------------------ |
-| `path`    | `string[]`                                        | ✅       | Path to the file               |
-| `control` | `(path, readConcurrencyMap) => ReadControlResult` | ❌       | Access & rate control callback |
+| Field     | Type                                              | Required | Description                                                                  |
+| --------- | ------------------------------------------------- | -------- | ---------------------------------------------------------------------------- |
+| `path`    | `string[]`                                        | ✅       | Path to the file                                                             |
+| `control` | `(path, readConcurrencyMap) => ReadControlResult` | ❌       | Access & rate control callback                                               |
+| `skip`    | `number`                                          | ❌       | Byte offset to start streaming from (see [Range reads](#️-range-reads-skip)) |
 
 #### `ReadControlResult`
 
@@ -637,17 +641,18 @@ await fs.init(); // ← GC runs here, concurrently
 
 ### `surreal_fs_files`
 
-| Column              | Type             | Description                               |
-| ------------------- | ---------------- | ----------------------------------------- |
-| `uri`               | `string`         | URI-encoded path (UNIQUE index)           |
-| `path`              | `array<string>`  | Original path array                       |
-| `size`              | `int`            | Total file size in bytes                  |
-| `metadata`          | `object`         | User-defined metadata                     |
-| `upload_id`         | `string`         | UUID of the current active chunk set      |
-| `pending_upload_id` | `option<string>` | UUID of an in-progress replacement        |
-| `status`            | `string`         | `"complete"`, `"saving"`, or `"deleting"` |
-| `created_at`        | `datetime`       | Row creation time                         |
-| `updated_at`        | `datetime`       | Last modification time                    |
+| Column              | Type             | Description                                 |
+| ------------------- | ---------------- | ------------------------------------------- |
+| `uri`               | `string`         | URI-encoded path (UNIQUE index)             |
+| `path`              | `array<string>`  | Original path array                         |
+| `size`              | `int`            | Total file size in bytes                    |
+| `metadata`          | `object`         | User-defined metadata                       |
+| `hash`              | `string`         | SHA3-512 digest of the file (128 hex chars) |
+| `upload_id`         | `string`         | UUID of the current active chunk set        |
+| `pending_upload_id` | `option<string>` | UUID of an in-progress replacement          |
+| `status`            | `string`         | `"complete"`, `"saving"`, or `"deleting"`   |
+| `created_at`        | `datetime`       | Row creation time                           |
+| `updated_at`        | `datetime`       | Last modification time                      |
 
 ### `surreal_fs_chunks`
 
@@ -818,6 +823,189 @@ await backupDir(
   ["company_abc", "backups", "2025-01-15"],
 );
 ```
+
+---
+
+## 🔐 SHA3-512 Content Hash
+
+Every successful upload computes a **SHA3-512** digest of the file content and
+stores it alongside the file metadata. The digest is **computed iteratively as
+chunks flow through the upload pipeline** — the library never materialises the
+entire payload in memory, so gigabyte-scale uploads hash in constant space.
+
+The hash is exposed on every read and listing, and the `Sha3_512` class is
+exported so you can reuse it anywhere in your app.
+
+### Why SHA3-512 and not WebCrypto?
+
+`crypto.subtle` **does not implement SHA3 (Keccak)** in any runtime. Instead of
+depending on a runtime-specific native API, SurrealFS ships its own
+zero-dependency SHA3-512 port (faithfully adapted from
+[emn178/js-sha3](https://github.com/emn178/js-sha3)). The implementation uses
+only portable TypeScript and works identically on Deno, Node.js, Bun, and the
+browser.
+
+### Accessing the hash
+
+```ts
+// After a save
+const result = await fs.save({ path: ["docs", "spec.pdf"], content: bytes });
+if ("hash" in result) {
+  console.log(result.hash); // 128 lowercase hex chars
+}
+
+// On read
+const file = await fs.read({ path: ["docs", "spec.pdf"] });
+if (file && "hash" in file) {
+  console.log("Stored hash:", file.hash);
+}
+
+// In a directory listing
+const { files } = await fs.readDir({ path: ["docs"] });
+for (const f of files) {
+  if (!("status" in f)) console.log(f.URIComponent, "→", f.hash);
+}
+```
+
+### Standalone usage of `Sha3_512`
+
+```ts
+import { Sha3_512 } from "jsr:@hviana/surreal-fs";
+
+const h = new Sha3_512();
+h.update(new TextEncoder().encode("hello, "));
+h.update(new TextEncoder().encode("world"));
+console.log(h.hex());
+// "840006653e9ac9e95117a15c915caab81662918e925de9e004f774ff82d7079a40d4d27b1b372657c61d46d470304c88c788b3a4527ad074d1dccbee5dbaa99a"
+```
+
+| Method                       | Description                                        |
+| ---------------------------- | -------------------------------------------------- |
+| `new Sha3_512()`             | Create a fresh hasher.                             |
+| `.update(bytes: Uint8Array)` | Absorb more bytes. May be called repeatedly.       |
+| `.hex(): string`             | Finalise and return 128-char lowercase hex digest. |
+
+> ⚠️ After `.hex()` the instance is **sealed** — further `.update()` calls
+> throw.
+
+### Verifying a download
+
+```ts
+const file = await fs.read({ path: ["docs", "spec.pdf"] });
+if (file && "content" in file && file.content && file.hash) {
+  const verifier = new Sha3_512();
+  for await (const chunk of file.content as any) verifier.update(chunk);
+
+  if (verifier.hex() !== file.hash) {
+    throw new Error("Integrity check failed!");
+  }
+}
+```
+
+---
+
+## ⏭️ Range Reads (`skip`)
+
+The `read()` method accepts an optional **`skip`** parameter that starts the
+content stream at an arbitrary byte offset. This is a **true range read** —
+chunks before the skip point are never loaded from the database.
+
+```
+File (bytes):  ┌──────────┬──────────┬──────────┬──────────┬─────┐
+               │  chunk 1 │  chunk 2 │  chunk 3 │  chunk 4 │  …  │
+               │   64 KB  │   64 KB  │   64 KB  │   64 KB  │     │
+               └──────────┴──────────┴──────────┴──────────┴─────┘
+                      ▲ skip = 150 000
+                      │
+               Start stream here:
+                 • chunk_index starts at 3
+                 • first chunk sliced from offset (150000 mod 65536) = 18 928
+                 • chunks 1 & 2 are never fetched
+```
+
+### Behaviour
+
+| `skip` value       | Behaviour                         |
+| ------------------ | --------------------------------- |
+| `0` or `undefined` | Stream the full file (default).   |
+| `0 < skip < size`  | Start streaming at byte `skip`.   |
+| `skip >= size`     | Clamped to `size` → empty stream. |
+| `skip < 0`         | Treated as `0`.                   |
+
+The reported `file.size` and `file.hash` **always refer to the full file** —
+they do not change based on the skip offset.
+
+### Examples
+
+**Jump to the middle of a large video:**
+
+```ts
+const file = await fs.read({
+  path: ["videos", "movie.mp4"],
+  skip: Math.floor(fileSize / 2),
+});
+
+for await (const chunk of file!.content as any) {
+  // Playback starts at the halfway point.
+}
+```
+
+**Read only the last 1 KB (file trailer):**
+
+```ts
+const meta = await fs.getMetadata(["archives", "big.zip"]);
+const size = (await fs.read({ path: ["archives", "big.zip"] }))!.size!;
+
+const tail = await fs.read({
+  path: ["archives", "big.zip"],
+  skip: Math.max(0, size - 1024),
+});
+const bytes = await SurrealFS.readStream(tail!.content!);
+```
+
+**Resume an interrupted download:**
+
+```ts
+const downloaded = bytesAlreadyOnDisk(); // your bookkeeping
+const file = await fs.read({
+  path: ["releases", "installer.bin"],
+  skip: downloaded,
+});
+
+// Continue streaming from exactly where you left off.
+```
+
+**HTTP `Range: bytes=START-` handling:**
+
+```ts
+async function handleRange(req: Request, path: string[]): Promise<Response> {
+  const range = req.headers.get("Range") ?? "";
+  const match = range.match(/^bytes=(\d+)-/);
+  const skip = match ? Number(match[1]) : 0;
+
+  const file = await fs.read({ path, skip });
+  if (!file || "status" in file) {
+    return new Response("Not found", { status: 404 });
+  }
+
+  const total = file.size;
+  const status = skip > 0 ? 206 : 200;
+  return new Response(file.content, {
+    status,
+    headers: {
+      "Accept-Ranges": "bytes",
+      "Content-Length": String(total - skip),
+      ...(skip > 0 &&
+        { "Content-Range": `bytes ${skip}-${total - 1}/${total}` }),
+    },
+  });
+}
+```
+
+> 💡 The skip is **chunk-aware**: only the chunk containing the starting byte
+> and everything after it is ever fetched. For a 10 GB file,
+> `skip = 9_000_000_000` reads a single chunk before the stream starts producing
+> output.
 
 ---
 

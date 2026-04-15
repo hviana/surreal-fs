@@ -124,6 +124,22 @@ export interface ReadOptions {
     path: string[],
     readConcurrencyMap: Record<string, number | undefined>,
   ) => Promise<ReadControlResult> | ReadControlResult;
+  /**
+   * Byte offset to start reading from. The returned `content` stream will
+   * begin at this position in the file, as if the first `skip` bytes had
+   * been discarded. Only honoured by {@link SurrealFS.read} — ignored by
+   * {@link SurrealFS.readDir}.
+   *
+   * Internally, the seek is chunk-aware: only the chunk containing the
+   * starting offset is fetched and sliced; earlier chunks are never read
+   * from the database.
+   *
+   * - `0` or omitted  → stream the full file (default).
+   * - `size`          → returns an empty stream (end of file).
+   * - `> size`        → clamped to `size` (empty stream).
+   * - `< 0`           → treated as `0`.
+   */
+  skip?: number;
 }
 
 /**
@@ -147,6 +163,14 @@ export interface File {
   URIComponent?: string;
   /** User-defined metadata. */
   metadata?: Record<string, any>;
+  /**
+   * SHA3-512 digest of the full (unsliced) file content, as 128 lowercase
+   * hex characters. Computed iteratively during {@link SurrealFS.save}.
+   *
+   * Remains the digest of the complete file even when the content stream is
+   * obtained with a non-zero `skip`.
+   */
+  hash?: string;
 }
 
 /**
@@ -303,6 +327,474 @@ function throttleTransform(
       ctl.enqueue(chunk);
     },
   });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SHA3-512
+//
+// Faithful TypeScript port of the SHA3-512 variant of emn178/js-sha3
+// (https://github.com/emn178/js-sha3, MIT). Only the SHA3-512 path is
+// reproduced — constants, padding, state layout, update/finalize logic and
+// the Keccak-f[1600] permutation are identical to the reference. Output is
+// always lowercase hex.
+//
+// The class exposes an incremental API so large payloads may be hashed while
+// streaming, without buffering the entire input in memory.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** @internal Lowercase hex alphabet used by {@link Sha3_512.hex}. */
+const HEX_CHARS = "0123456789abcdef".split("");
+
+/** @internal Byte-to-word shift lookup (little-endian lane packing). */
+const SHIFT = [0, 8, 16, 24];
+
+/** @internal SHA3 domain-separation padding (reference: `PADDING`). */
+const SHA3_PADDING = [6, 1536, 393216, 100663296];
+
+/** @internal Round constants for Keccak-f[1600] (lo/hi word pairs). */
+const RC = [
+  1,
+  0,
+  32898,
+  0,
+  32906,
+  2147483648,
+  2147516416,
+  2147483648,
+  32907,
+  0,
+  2147483649,
+  0,
+  2147516545,
+  2147483648,
+  32777,
+  2147483648,
+  138,
+  0,
+  136,
+  0,
+  2147516425,
+  0,
+  2147483658,
+  0,
+  2147516555,
+  0,
+  139,
+  2147483648,
+  32905,
+  2147483648,
+  32771,
+  2147483648,
+  32770,
+  2147483648,
+  128,
+  2147483648,
+  32778,
+  0,
+  2147483658,
+  2147483648,
+  2147516545,
+  2147483648,
+  32896,
+  2147483648,
+  2147483649,
+  0,
+  2147516424,
+  2147483648,
+];
+
+/**
+ * Keccak-f[1600] permutation — 24 rounds unrolled in pairs.
+ * Operates in-place on a 50-element lo/hi word state.
+ * @internal
+ */
+function keccakF(s: number[]): void {
+  let h: number, l: number, n: number;
+  let c0: number,
+    c1: number,
+    c2: number,
+    c3: number,
+    c4: number,
+    c5: number,
+    c6: number,
+    c7: number,
+    c8: number,
+    c9: number;
+  let b0: number,
+    b1: number,
+    b2: number,
+    b3: number,
+    b4: number,
+    b5: number,
+    b6: number,
+    b7: number,
+    b8: number,
+    b9: number,
+    b10: number,
+    b11: number,
+    b12: number,
+    b13: number,
+    b14: number,
+    b15: number,
+    b16: number,
+    b17: number,
+    b18: number,
+    b19: number,
+    b20: number,
+    b21: number,
+    b22: number,
+    b23: number,
+    b24: number,
+    b25: number,
+    b26: number,
+    b27: number,
+    b28: number,
+    b29: number,
+    b30: number,
+    b31: number,
+    b32: number,
+    b33: number,
+    b34: number,
+    b35: number,
+    b36: number,
+    b37: number,
+    b38: number,
+    b39: number,
+    b40: number,
+    b41: number,
+    b42: number,
+    b43: number,
+    b44: number,
+    b45: number,
+    b46: number,
+    b47: number,
+    b48: number,
+    b49: number;
+
+  for (n = 0; n < 48; n += 2) {
+    c0 = s[0] ^ s[10] ^ s[20] ^ s[30] ^ s[40];
+    c1 = s[1] ^ s[11] ^ s[21] ^ s[31] ^ s[41];
+    c2 = s[2] ^ s[12] ^ s[22] ^ s[32] ^ s[42];
+    c3 = s[3] ^ s[13] ^ s[23] ^ s[33] ^ s[43];
+    c4 = s[4] ^ s[14] ^ s[24] ^ s[34] ^ s[44];
+    c5 = s[5] ^ s[15] ^ s[25] ^ s[35] ^ s[45];
+    c6 = s[6] ^ s[16] ^ s[26] ^ s[36] ^ s[46];
+    c7 = s[7] ^ s[17] ^ s[27] ^ s[37] ^ s[47];
+    c8 = s[8] ^ s[18] ^ s[28] ^ s[38] ^ s[48];
+    c9 = s[9] ^ s[19] ^ s[29] ^ s[39] ^ s[49];
+
+    h = c8 ^ ((c2 << 1) | (c3 >>> 31));
+    l = c9 ^ ((c3 << 1) | (c2 >>> 31));
+    s[0] ^= h;
+    s[1] ^= l;
+    s[10] ^= h;
+    s[11] ^= l;
+    s[20] ^= h;
+    s[21] ^= l;
+    s[30] ^= h;
+    s[31] ^= l;
+    s[40] ^= h;
+    s[41] ^= l;
+    h = c0 ^ ((c4 << 1) | (c5 >>> 31));
+    l = c1 ^ ((c5 << 1) | (c4 >>> 31));
+    s[2] ^= h;
+    s[3] ^= l;
+    s[12] ^= h;
+    s[13] ^= l;
+    s[22] ^= h;
+    s[23] ^= l;
+    s[32] ^= h;
+    s[33] ^= l;
+    s[42] ^= h;
+    s[43] ^= l;
+    h = c2 ^ ((c6 << 1) | (c7 >>> 31));
+    l = c3 ^ ((c7 << 1) | (c6 >>> 31));
+    s[4] ^= h;
+    s[5] ^= l;
+    s[14] ^= h;
+    s[15] ^= l;
+    s[24] ^= h;
+    s[25] ^= l;
+    s[34] ^= h;
+    s[35] ^= l;
+    s[44] ^= h;
+    s[45] ^= l;
+    h = c4 ^ ((c8 << 1) | (c9 >>> 31));
+    l = c5 ^ ((c9 << 1) | (c8 >>> 31));
+    s[6] ^= h;
+    s[7] ^= l;
+    s[16] ^= h;
+    s[17] ^= l;
+    s[26] ^= h;
+    s[27] ^= l;
+    s[36] ^= h;
+    s[37] ^= l;
+    s[46] ^= h;
+    s[47] ^= l;
+    h = c6 ^ ((c0 << 1) | (c1 >>> 31));
+    l = c7 ^ ((c1 << 1) | (c0 >>> 31));
+    s[8] ^= h;
+    s[9] ^= l;
+    s[18] ^= h;
+    s[19] ^= l;
+    s[28] ^= h;
+    s[29] ^= l;
+    s[38] ^= h;
+    s[39] ^= l;
+    s[48] ^= h;
+    s[49] ^= l;
+
+    b0 = s[0];
+    b1 = s[1];
+    b32 = (s[11] << 4) | (s[10] >>> 28);
+    b33 = (s[10] << 4) | (s[11] >>> 28);
+    b14 = (s[20] << 3) | (s[21] >>> 29);
+    b15 = (s[21] << 3) | (s[20] >>> 29);
+    b46 = (s[31] << 9) | (s[30] >>> 23);
+    b47 = (s[30] << 9) | (s[31] >>> 23);
+    b28 = (s[40] << 18) | (s[41] >>> 14);
+    b29 = (s[41] << 18) | (s[40] >>> 14);
+    b20 = (s[2] << 1) | (s[3] >>> 31);
+    b21 = (s[3] << 1) | (s[2] >>> 31);
+    b2 = (s[13] << 12) | (s[12] >>> 20);
+    b3 = (s[12] << 12) | (s[13] >>> 20);
+    b34 = (s[22] << 10) | (s[23] >>> 22);
+    b35 = (s[23] << 10) | (s[22] >>> 22);
+    b16 = (s[33] << 13) | (s[32] >>> 19);
+    b17 = (s[32] << 13) | (s[33] >>> 19);
+    b48 = (s[42] << 2) | (s[43] >>> 30);
+    b49 = (s[43] << 2) | (s[42] >>> 30);
+    b40 = (s[5] << 30) | (s[4] >>> 2);
+    b41 = (s[4] << 30) | (s[5] >>> 2);
+    b22 = (s[14] << 6) | (s[15] >>> 26);
+    b23 = (s[15] << 6) | (s[14] >>> 26);
+    b4 = (s[25] << 11) | (s[24] >>> 21);
+    b5 = (s[24] << 11) | (s[25] >>> 21);
+    b36 = (s[34] << 15) | (s[35] >>> 17);
+    b37 = (s[35] << 15) | (s[34] >>> 17);
+    b18 = (s[45] << 29) | (s[44] >>> 3);
+    b19 = (s[44] << 29) | (s[45] >>> 3);
+    b10 = (s[6] << 28) | (s[7] >>> 4);
+    b11 = (s[7] << 28) | (s[6] >>> 4);
+    b42 = (s[17] << 23) | (s[16] >>> 9);
+    b43 = (s[16] << 23) | (s[17] >>> 9);
+    b24 = (s[26] << 25) | (s[27] >>> 7);
+    b25 = (s[27] << 25) | (s[26] >>> 7);
+    b6 = (s[36] << 21) | (s[37] >>> 11);
+    b7 = (s[37] << 21) | (s[36] >>> 11);
+    b38 = (s[47] << 24) | (s[46] >>> 8);
+    b39 = (s[46] << 24) | (s[47] >>> 8);
+    b30 = (s[8] << 27) | (s[9] >>> 5);
+    b31 = (s[9] << 27) | (s[8] >>> 5);
+    b12 = (s[18] << 20) | (s[19] >>> 12);
+    b13 = (s[19] << 20) | (s[18] >>> 12);
+    b44 = (s[29] << 7) | (s[28] >>> 25);
+    b45 = (s[28] << 7) | (s[29] >>> 25);
+    b26 = (s[38] << 8) | (s[39] >>> 24);
+    b27 = (s[39] << 8) | (s[38] >>> 24);
+    b8 = (s[48] << 14) | (s[49] >>> 18);
+    b9 = (s[49] << 14) | (s[48] >>> 18);
+
+    s[0] = b0 ^ (~b2 & b4);
+    s[1] = b1 ^ (~b3 & b5);
+    s[10] = b10 ^ (~b12 & b14);
+    s[11] = b11 ^ (~b13 & b15);
+    s[20] = b20 ^ (~b22 & b24);
+    s[21] = b21 ^ (~b23 & b25);
+    s[30] = b30 ^ (~b32 & b34);
+    s[31] = b31 ^ (~b33 & b35);
+    s[40] = b40 ^ (~b42 & b44);
+    s[41] = b41 ^ (~b43 & b45);
+    s[2] = b2 ^ (~b4 & b6);
+    s[3] = b3 ^ (~b5 & b7);
+    s[12] = b12 ^ (~b14 & b16);
+    s[13] = b13 ^ (~b15 & b17);
+    s[22] = b22 ^ (~b24 & b26);
+    s[23] = b23 ^ (~b25 & b27);
+    s[32] = b32 ^ (~b34 & b36);
+    s[33] = b33 ^ (~b35 & b37);
+    s[42] = b42 ^ (~b44 & b46);
+    s[43] = b43 ^ (~b45 & b47);
+    s[4] = b4 ^ (~b6 & b8);
+    s[5] = b5 ^ (~b7 & b9);
+    s[14] = b14 ^ (~b16 & b18);
+    s[15] = b15 ^ (~b17 & b19);
+    s[24] = b24 ^ (~b26 & b28);
+    s[25] = b25 ^ (~b27 & b29);
+    s[34] = b34 ^ (~b36 & b38);
+    s[35] = b35 ^ (~b37 & b39);
+    s[44] = b44 ^ (~b46 & b48);
+    s[45] = b45 ^ (~b47 & b49);
+    s[6] = b6 ^ (~b8 & b0);
+    s[7] = b7 ^ (~b9 & b1);
+    s[16] = b16 ^ (~b18 & b10);
+    s[17] = b17 ^ (~b19 & b11);
+    s[26] = b26 ^ (~b28 & b20);
+    s[27] = b27 ^ (~b29 & b21);
+    s[36] = b36 ^ (~b38 & b30);
+    s[37] = b37 ^ (~b39 & b31);
+    s[46] = b46 ^ (~b48 & b40);
+    s[47] = b47 ^ (~b49 & b41);
+    s[8] = b8 ^ (~b0 & b2);
+    s[9] = b9 ^ (~b1 & b3);
+    s[18] = b18 ^ (~b10 & b12);
+    s[19] = b19 ^ (~b11 & b13);
+    s[28] = b28 ^ (~b20 & b22);
+    s[29] = b29 ^ (~b21 & b23);
+    s[38] = b38 ^ (~b30 & b32);
+    s[39] = b39 ^ (~b31 & b33);
+    s[48] = b48 ^ (~b40 & b42);
+    s[49] = b49 ^ (~b41 & b43);
+
+    s[0] ^= RC[n];
+    s[1] ^= RC[n + 1];
+  }
+}
+
+/**
+ * Incremental SHA3-512 hasher.
+ *
+ * Mirrors the SHA3-512 variant of the emn178/js-sha3 reference implementation
+ * and produces byte-identical digests. The algorithm parameters are fixed:
+ *
+ *   - rate      : 576 bits (18 × 32-bit words, 72 bytes per block)
+ *   - capacity  : 1024 bits
+ *   - output    : 512 bits (128 lowercase hex characters)
+ *   - padding   : SHA3 domain separation (`0x06 … 0x80`)
+ *
+ * Usage:
+ *
+ * ```ts
+ * const h = new Sha3_512();
+ * h.update(firstChunk);
+ * h.update(secondChunk);
+ * const digest = h.hex(); // 128-char lowercase hex
+ * ```
+ *
+ * After {@link hex} is called the instance is finalized — any subsequent
+ * {@link update} call throws.
+ */
+export class Sha3_512 {
+  /** @internal 19-word message-scheduling buffer. */
+  private blocks: number[] = [];
+  /** @internal 50-word (25 × 64-bit) Keccak state, stored as lo/hi pairs. */
+  private s: number[];
+  /** @internal Whether the buffer needs to be zeroed before the next absorb. */
+  private reset = true;
+  /** @internal Whether {@link hex} has already been called. */
+  private finalized = false;
+  /** @internal Carry-over word between update() calls. */
+  private block = 0;
+  /** @internal Next byte-offset to write inside {@link blocks}. */
+  private start = 0;
+  /** @internal Byte offset reached inside the current block (for finalize). */
+  private lastByteIndex = 0;
+
+  /** @internal Rate in 32-bit words: (1600 − 2·512) ÷ 32 = 18. */
+  private readonly blockCount = 18;
+  /** @internal Rate in bytes: {@link blockCount} · 4 = 72. */
+  private readonly byteCount = 72;
+  /** @internal Output size in 32-bit words: 512 ÷ 32 = 16. */
+  private readonly outputBlocks = 16;
+
+  /**
+   * Create a fresh SHA3-512 hashing context.
+   */
+  constructor() {
+    this.s = new Array<number>(50);
+    for (let i = 0; i < 50; ++i) this.s[i] = 0;
+  }
+
+  /**
+   * Absorb more bytes into the hash.
+   *
+   * May be called repeatedly with any slice sizes; the absorb phase is
+   * buffered internally so input need not be block-aligned.
+   *
+   * @param message - Bytes to feed into the sponge.
+   * @returns `this`, for chaining.
+   * @throws If called after {@link hex}.
+   */
+  update(message: Uint8Array): this {
+    if (this.finalized) throw new Error("finalize already called");
+    const blocks = this.blocks;
+    const byteCount = this.byteCount;
+    const blockCount = this.blockCount;
+    const length = message.length;
+    const s = this.s;
+    let index = 0;
+    let i: number;
+
+    while (index < length) {
+      if (this.reset) {
+        this.reset = false;
+        blocks[0] = this.block;
+        for (i = 1; i < blockCount + 1; ++i) blocks[i] = 0;
+      }
+      for (i = this.start; index < length && i < byteCount; ++index) {
+        blocks[i >> 2] |= message[index] << SHIFT[i++ & 3];
+      }
+      this.lastByteIndex = i;
+      if (i >= byteCount) {
+        this.start = i - byteCount;
+        this.block = blocks[blockCount];
+        for (i = 0; i < blockCount; ++i) s[i] ^= blocks[i];
+        keccakF(s);
+        this.reset = true;
+      } else {
+        this.start = i;
+      }
+    }
+    return this;
+  }
+
+  /**
+   * Apply SHA3 padding and run the final permutation.
+   * @internal
+   */
+  private finalize(): void {
+    if (this.finalized) return;
+    this.finalized = true;
+    const blocks = this.blocks;
+    const blockCount = this.blockCount;
+    const s = this.s;
+    let i = this.lastByteIndex;
+    blocks[i >> 2] |= SHA3_PADDING[i & 3];
+    if (this.lastByteIndex === this.byteCount) {
+      blocks[0] = blocks[blockCount];
+      for (i = 1; i < blockCount + 1; ++i) blocks[i] = 0;
+    }
+    blocks[blockCount - 1] |= 0x80000000;
+    for (i = 0; i < blockCount; ++i) s[i] ^= blocks[i];
+    keccakF(s);
+  }
+
+  /**
+   * Finalize and return the 128-character lowercase hex digest.
+   *
+   * After this call the instance is sealed — further {@link update} calls
+   * will throw.
+   *
+   * @returns The SHA3-512 hash as hex (128 lowercase characters).
+   */
+  hex(): string {
+    this.finalize();
+    const blockCount = this.blockCount;
+    const outputBlocks = this.outputBlocks;
+    const s = this.s;
+    let hex = "";
+    let block: number;
+    // For SHA3-512, outputBlocks (16) < blockCount (18), so a single
+    // squeeze round covers the full digest — no re-permutation needed.
+    for (let i = 0; i < blockCount && i < outputBlocks; ++i) {
+      block = s[i];
+      hex += HEX_CHARS[(block >> 4) & 0x0F] + HEX_CHARS[block & 0x0F] +
+        HEX_CHARS[(block >> 12) & 0x0F] + HEX_CHARS[(block >> 8) & 0x0F] +
+        HEX_CHARS[(block >> 20) & 0x0F] + HEX_CHARS[(block >> 16) & 0x0F] +
+        HEX_CHARS[(block >> 28) & 0x0F] + HEX_CHARS[(block >> 24) & 0x0F];
+    }
+    return hex;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -684,6 +1176,9 @@ export class SurrealFS {
       let chunkIndex = 0;
       let sizeBytes = 0;
       let exceededLimit = false;
+      // Iterative SHA3-512 hasher — fed one chunk at a time so the entire
+      // file never has to be held in memory.
+      const hasher = new Sha3_512();
 
       while (true) {
         const { done, value } = await reader.read();
@@ -694,6 +1189,8 @@ export class SurrealFS {
           exceededLimit = true;
           break;
         }
+
+        hasher.update(value);
 
         chunkIndex++;
         await this.db.query(
@@ -707,6 +1204,7 @@ export class SurrealFS {
         this._savingFiles[uri] = sizeBytes;
         this.onFileProgress(this.fileStatus(uri)!);
       }
+      const fileHash = exceededLimit ? "" : hasher.hex();
 
       if (exceededLimit) {
         // Clean up the partial upload.
@@ -737,6 +1235,7 @@ export class SurrealFS {
            path               = $path,
            size               = $size,
            metadata           = $meta,
+           hash               = $hash,
            status             = 'complete',
            updated_at         = time::now()
          WHERE uri = $uri`,
@@ -745,6 +1244,7 @@ export class SurrealFS {
           path: options.path,
           size: sizeBytes,
           meta: options.metadata ?? {},
+          hash: fileHash,
           uri,
         },
       );
@@ -760,6 +1260,7 @@ export class SurrealFS {
         URIComponent: uri,
         metadata: options.metadata ?? {},
         size: sizeBytes,
+        hash: fileHash,
       };
 
       this.cleanupSave(identifiers, uri);
@@ -834,15 +1335,24 @@ export class SurrealFS {
       size: record.size,
       URIComponent: uri,
       metadata: record.metadata ?? {},
+      hash: record.hash ?? undefined,
     };
 
     const identifiers = ctrl.concurrencyIdentifiers ?? [];
     const chunksPerSecond = ctrl.chunksPerSecond ?? Number.MAX_SAFE_INTEGER;
 
+    // Clamp skip to [0, size]. A skip at or past EOF produces an empty stream.
+    const rawSkip = options.skip ?? 0;
+    const skip = Math.max(
+      0,
+      Math.min(rawSkip < 0 ? 0 : rawSkip, record.size ?? 0),
+    );
+
     file.content = this.buildContentStream(
       record.upload_id,
       chunksPerSecond,
       identifiers,
+      skip,
     );
 
     return file;
@@ -937,6 +1447,7 @@ export class SurrealFS {
           size: row.size ?? 0,
           URIComponent: fileUri,
           metadata: row.metadata ?? {},
+          hash: row.hash ?? undefined,
         };
         if (row.status === "complete" && row.upload_id) {
           f.content = this.buildContentStream(
@@ -1150,17 +1661,40 @@ export class SurrealFS {
   }
 
   /**
-   * Build a lazy ReadableStream that fetches chunks from the database
-   * in order, applying rate limiting via a TransformStream.
+   * Build a lazy {@link ReadableStream} that fetches chunks from the
+   * database in order, applying rate limiting via a {@link TransformStream}.
+   *
+   * When `skip` is greater than zero the stream starts at the byte offset
+   * `skip`: the chunk containing that byte is the first to be fetched
+   * (earlier chunks are skipped at the query level, not read from storage),
+   * and its leading bytes are sliced off so the consumer sees exactly
+   * `size − skip` bytes. Chunks are stored 1-indexed and sized at
+   * {@link CHUNK_SIZE}, so the first chunk fetched has index
+   * `floor(skip / CHUNK_SIZE) + 1` and the intra-chunk offset is
+   * `skip mod CHUNK_SIZE`.
+   *
+   * @param uploadId - The upload id used to locate chunks.
+   * @param chunksPerSecond - Throughput cap applied to the output stream.
+   * @param concurrencyIdentifiers - Concurrency map keys to increment on
+   *   first pull and decrement on close/cancel/error.
+   * @param skip - Byte offset at which to start. `0` means read from the
+   *   start. Must be `>= 0` (callers are expected to clamp to `[0, size]`).
    * @internal
    */
   private buildContentStream(
     uploadId: string,
     chunksPerSecond: number,
     concurrencyIdentifiers: string[],
+    skip: number = 0,
   ): ReadableStream<Uint8Array> {
     const db = this.db;
-    let lastIndex = 0;
+    // Chunks are 1-indexed; `lastIndex` tracks the last one delivered so
+    // the next query asks for chunk_index > lastIndex. To begin at chunk
+    // N we seed lastIndex to N − 1.
+    const startChunkIndex = skip > 0 ? Math.floor(skip / CHUNK_SIZE) + 1 : 1;
+    const firstChunkOffset = skip > 0 ? skip % CHUNK_SIZE : 0;
+    let lastIndex = startChunkIndex - 1;
+    let needsSlice = firstChunkOffset > 0;
     let started = false;
     const self = this;
 
@@ -1196,9 +1730,21 @@ export class SurrealFS {
 
           const row = rows[0];
           lastIndex = row.chunk_index;
-          const bytes = row.data instanceof Uint8Array
+          let bytes = row.data instanceof Uint8Array
             ? row.data
             : new Uint8Array(row.data);
+
+          // If the consumer asked for a mid-chunk start, slice the first
+          // chunk we emit so the stream begins at the exact byte.
+          if (needsSlice) {
+            needsSlice = false;
+            if (firstChunkOffset >= bytes.length) {
+              // Degenerate case: nothing left after the offset — pull again.
+              return;
+            }
+            bytes = bytes.subarray(firstChunkOffset);
+          }
+
           controller.enqueue(bytes);
         } catch (e) {
           self.decrementConcurrency(
